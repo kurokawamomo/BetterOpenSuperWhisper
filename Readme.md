@@ -1,6 +1,6 @@
 # OpenSuperWhisper
 
-> **Fork notice:** This is a personal fork of [Starmel/OpenSuperWhisper](https://github.com/Starmel/OpenSuperWhisper) adding a Tap-to-Siri / Hold-to-Whisper trigger key mode and a live transcription preview overlay.
+> **Fork notice:** This is a personal fork of [Starmel/OpenSuperWhisper](https://github.com/Starmel/OpenSuperWhisper) adding a Tap-to-Siri / Hold-to-Whisper trigger key mode, a live transcription preview overlay and reduce memory usage (via unload model when idle).
 
 OpenSuperWhisper is a macOS application that provides real-time audio transcription using the Whisper model. It offers a seamless way to record and transcribe audio with customizable settings and keyboard shortcuts.
 

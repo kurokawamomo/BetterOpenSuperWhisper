@@ -6,3 +6,10 @@ import os
 enum IdleUnloadLog {
     static let logger = Logger(subsystem: "ru.starmel.OpenSuperWhisper", category: "IdleUnload")
 }
+
+/// Diagnostics for the live preview, including a preview that starts late because
+/// the model was still loading when the recording began:
+/// `log show --last 30m --predicate 'subsystem == "ru.starmel.OpenSuperWhisper" AND category == "LivePreview"'`
+enum LivePreviewLog {
+    static let logger = Logger(subsystem: "ru.starmel.OpenSuperWhisper", category: "LivePreview")
+}

@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import os
 
@@ -136,6 +137,11 @@ class TranscriptionService: ObservableObject {
     private var engineSelection: EngineSelection?
     private var unloadTask: Task<Void, Never>?
 
+    /// Fires after a load has installed `currentEngine`. Deliberately not derived
+    /// from `$isLoading`: that publishes false before the engine is assigned, so a
+    /// subscriber reacting to it would still find no engine.
+    let engineDidLoad = PassthroughSubject<Void, Never>()
+
     /// With idle unloading on, nothing is loaded at launch: the first key press
     /// loads the model (see `ensureEngineLoaded`), so a freshly started app is as
     /// light as one whose model was released after sitting idle.
@@ -235,7 +241,9 @@ class TranscriptionService: ObservableObject {
         engineLoadID = nil
         isLoading = false
         switch result {
-        case .success(let engine): currentEngine = engine
+        case .success(let engine):
+            currentEngine = engine
+            engineDidLoad.send()
         case .failure(let error): loadingError = error.localizedDescription
         }
     }
