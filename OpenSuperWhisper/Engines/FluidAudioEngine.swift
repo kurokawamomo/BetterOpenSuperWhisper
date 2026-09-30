@@ -33,7 +33,13 @@ class FluidAudioEngine: TranscriptionEngine {
         asrManager = manager
         asrModels = models
     }
-    
+
+    func unload() {
+        cancelTranscription()
+        asrManager = nil
+        asrModels = nil
+    }
+
     func transcribeAudio(url: URL, settings: Settings) async throws -> String {
         guard let asrManager = asrManager else {
             throw TranscriptionError.contextInitializationFailed

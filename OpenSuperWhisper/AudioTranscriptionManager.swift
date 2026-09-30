@@ -2,6 +2,7 @@ import AVFoundation
 import Combine
 import Foundation
 import Speech
+import os
 
 /// Drives ONE live-preview transcription session. Implementations receive raw
 /// microphone buffers as they arrive during recording and report partial text as
@@ -197,7 +198,11 @@ final class WhisperLivePreviewEngine: LivePreviewEngine {
     private static let stepDuration: TimeInterval = 1.2
     private static let sampleRate: Double = 16000
 
-    private let context: MyWhisperContext
+    /// Weak on purpose: a live-preview engine must never extend the model's lifetime.
+    /// If it held the context strongly, a lingering instance would keep the weights
+    /// alive after an idle release (whisper_free would never run). A decode that
+    /// finds the context gone simply does nothing.
+    private weak var context: MyWhisperContext?
     private var state: OpaquePointer?
     private var converter: AVAudioConverter?
     private let targetFormat: AVAudioFormat
@@ -224,6 +229,10 @@ final class WhisperLivePreviewEngine: LivePreviewEngine {
         state = secondaryState
         targetFormat = format
         print("[LivePreview][whisper][diag] secondary state created on shared context")
+    }
+
+    deinit {
+        IdleUnloadLog.logger.notice("WhisperLivePreviewEngine deinit")
     }
 
     func setBatchBusy(_ busy: Bool) {
@@ -281,7 +290,9 @@ final class WhisperLivePreviewEngine: LivePreviewEngine {
     }
 
     private func decodeCurrentWindow() {
-        guard let state else { return }
+        // Held strongly for the duration of one decode so the context cannot be
+        // freed underneath a running whisper_full_with_state.
+        guard let state, let context else { return }
 
         let windowSamples = Int(Self.windowDuration * Self.sampleRate)
         if pendingSamples.count > windowSamples {
@@ -337,7 +348,7 @@ final class WhisperLivePreviewEngine: LivePreviewEngine {
         queue.async { [weak self] in
             guard let self else { return }
             if let state = self.state {
-                self.context.freeSecondaryState(state)
+                MyWhisperContext.freeSecondaryState(state)
             }
             self.state = nil
             self.pendingSamples.removeAll()

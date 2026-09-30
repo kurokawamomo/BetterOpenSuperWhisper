@@ -6,6 +6,7 @@ final class NamedTestEngine: TranscriptionEngine {
     var isModelLoaded: Bool { true }
     init(_ name: String) { engineName = name }
     func initialize() async throws {}
+    func unload() {}
     func cancelTranscription() {}
     func getSupportedLanguages() -> [String] { ["en"] }
     func transcribeAudio(url: URL, settings: Settings) async throws -> String { engineName }
@@ -49,7 +50,7 @@ final class EngineLoadingTests: XCTestCase {
 
     func testShutdownWaitsForSupersededLoadsAndPreventsNewWork() async throws {
         let gate = EngineLoadGate()
-        let service = TranscriptionService(selection: a, engineLoader: { try await gate.load($0) })
+        let service = TranscriptionService(selection: a, loadOnInit: true, engineLoader: { try await gate.load($0) })
         try await waitForRequest("A", gate: gate)
         service.loadEngine(selection: b)
         try await waitForRequest("B", gate: gate)
@@ -79,7 +80,7 @@ final class EngineLoadingTests: XCTestCase {
 
     func testLateOldLoadCannotReplaceNewSelection() async throws {
         let gate = EngineLoadGate()
-        let service = TranscriptionService(selection: a, engineLoader: { try await gate.load($0) })
+        let service = TranscriptionService(selection: a, loadOnInit: true, engineLoader: { try await gate.load($0) })
         try await waitForRequest("A", gate: gate)
         service.loadEngine(selection: b)
         try await waitForRequest("B", gate: gate)
@@ -93,7 +94,7 @@ final class EngineLoadingTests: XCTestCase {
 
     func testTranscriptionWaitsForColdModelLoad() async throws {
         let gate = EngineLoadGate()
-        let service = TranscriptionService(selection: a, engineLoader: { try await gate.load($0) })
+        let service = TranscriptionService(selection: a, loadOnInit: true, engineLoader: { try await gate.load($0) })
         try await waitForRequest("A", gate: gate)
         let task = Task { try await service.transcribeAudio(url: url, settings: Settings()) }
         await Task.yield()
@@ -106,7 +107,7 @@ final class EngineLoadingTests: XCTestCase {
 
     func testCancelledWaiterDoesNotDecodeAfterModelLoads() async throws {
         let gate = EngineLoadGate()
-        let service = TranscriptionService(selection: a, engineLoader: { try await gate.load($0) })
+        let service = TranscriptionService(selection: a, loadOnInit: true, engineLoader: { try await gate.load($0) })
         try await waitForRequest("A", gate: gate)
         let task = Task { try await service.transcribeAudio(url: url, settings: Settings()) }
         await Task.yield()
@@ -121,7 +122,7 @@ final class EngineLoadingTests: XCTestCase {
 
     func testDuplicateSelectionLoadsOnceAndFailureIsExposed() async throws {
         let gate = EngineLoadGate()
-        let service = TranscriptionService(selection: a, engineLoader: { try await gate.load($0) })
+        let service = TranscriptionService(selection: a, loadOnInit: true, engineLoader: { try await gate.load($0) })
         try await waitForRequest("A", gate: gate)
         service.loadEngine(selection: a)
         let count = await gate.count

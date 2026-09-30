@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import os
 
 // MARK: - C Type Wrappers
 
@@ -39,6 +40,7 @@ public class MyWhisperVadContext {
     deinit {
         if let vctx = vctx {
             whisper_vad_free(vctx)
+            IdleUnloadLog.logger.notice("MyWhisperVadContext deinit: whisper_vad_free called")
         }
     }
     
@@ -79,6 +81,7 @@ public class MyWhisperContext {
     deinit {
         freeState()
         freeContext()
+        IdleUnloadLog.logger.notice("MyWhisperContext deinit: whisper_free called")
     }
     
     // MARK: - Initialization
@@ -717,7 +720,9 @@ public class MyWhisperContext {
         return whisper_init_state(ctx)
     }
 
-    public func freeSecondaryState(_ state: OpaquePointer) {
+    /// Static on purpose: a live-preview engine holds the context only weakly, so it
+    /// must still be able to free its state after the context itself is gone.
+    public static func freeSecondaryState(_ state: OpaquePointer) {
         whisper_free_state(state)
     }
 
