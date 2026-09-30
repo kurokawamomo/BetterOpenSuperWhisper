@@ -15,6 +15,32 @@ protocol LivePreviewEngine: AnyObject {
     func stop()
 }
 
+/// Keeps only the most recent `maxDuration` of microphone buffers. Holds the
+/// audio recorded while the live-preview engine cannot exist yet (the model is
+/// still loading) so the engine can catch up once it does. The buffers are the
+/// immutable copies the recorder already makes, so nothing is duplicated.
+struct LiveAudioCatchUpBuffer {
+    let maxDuration: TimeInterval
+    private(set) var buffers: [AVAudioPCMBuffer] = []
+    private(set) var duration: TimeInterval = 0
+
+    init(maxDuration: TimeInterval) {
+        self.maxDuration = maxDuration
+    }
+
+    private static func duration(of buffer: AVAudioPCMBuffer) -> TimeInterval {
+        Double(buffer.frameLength) / buffer.format.sampleRate
+    }
+
+    mutating func append(_ buffer: AVAudioPCMBuffer) {
+        buffers.append(buffer)
+        duration += Self.duration(of: buffer)
+        while duration > maxDuration, buffers.count > 1 {
+            duration -= Self.duration(of: buffers.removeFirst())
+        }
+    }
+}
+
 /// Orchestrates the live-preview engine for the current recording. Owns no audio
 /// capture itself: `AudioRecorder` fans out the same buffers it already taps for
 /// the final recording into `appendLiveAudio`, keyed by the recording's session ID
@@ -34,8 +60,13 @@ final class AudioTranscriptionManager: ObservableObject {
     private let stateLock = NSLock()
     private nonisolated(unsafe) var activeSessionID: UUID?
     private nonisolated(unsafe) var engine: LivePreviewEngine?
+    /// Set while a Whisper preview is waiting for the model to finish loading: the
+    /// session is active but has no engine yet, so its audio is kept here instead of
+    /// being dropped. Guarded by `stateLock` like the two above.
+    private nonisolated(unsafe) var waitingForModel: LiveAudioCatchUpBuffer?
 
     private var batchBusyCancellable: AnyCancellable?
+    private var modelLoadCancellable: AnyCancellable?
 
     private init() {}
 
@@ -52,16 +83,14 @@ final class AudioTranscriptionManager: ObservableObject {
         let newEngine: LivePreviewEngine?
         switch AppPreferences.shared.livePreviewEngine {
         case "whisper":
-            if let whisperEngine = TranscriptionService.shared.whisperEngineForLivePreview,
-               let whisperLiveEngine = WhisperLivePreviewEngine(whisperEngine: whisperEngine) {
-                // The final batch pass must never wait on (or be slowed down by) a
-                // live-preview decode sharing the same model weights, so the live
-                // loop skips its tick whenever a batch transcription is in flight.
-                batchBusyCancellable = TranscriptionService.shared.$isTranscribing
-                    .sink { [weak whisperLiveEngine] busy in
-                        whisperLiveEngine?.setBatchBusy(busy)
-                    }
+            if let whisperLiveEngine = makeWhisperEngine() {
                 newEngine = whisperLiveEngine
+            } else if TranscriptionService.shared.isLoading {
+                // The model is still loading (the first recording after an idle
+                // release): keep the audio and start the preview the moment the
+                // load finishes, rather than giving up for the whole recording.
+                deferUntilModelLoads(sessionID: sessionID)
+                return
             } else {
                 print("[LivePreview] whisper selected, but the active batch engine isn't Whisper (likely Parakeet) — skipping live preview for this recording rather than loading a second model")
                 newEngine = nil
@@ -82,6 +111,23 @@ final class AudioTranscriptionManager: ObservableObject {
 
         print("[LivePreview][diag] startLivePreview(\(sessionID)): engine=\(type(of: newEngine)) armed")
 
+        begin(newEngine, sessionID: sessionID)
+    }
+
+    private func makeWhisperEngine() -> WhisperLivePreviewEngine? {
+        guard let whisperEngine = TranscriptionService.shared.whisperEngineForLivePreview,
+              let liveEngine = WhisperLivePreviewEngine(whisperEngine: whisperEngine) else { return nil }
+        // The final batch pass must never wait on (or be slowed down by) a
+        // live-preview decode sharing the same model weights, so the live
+        // loop skips its tick whenever a batch transcription is in flight.
+        batchBusyCancellable = TranscriptionService.shared.$isTranscribing
+            .sink { [weak liveEngine] busy in
+                liveEngine?.setBatchBusy(busy)
+            }
+        return liveEngine
+    }
+
+    private func begin(_ newEngine: LivePreviewEngine, sessionID: UUID) {
         newEngine.start { [weak self] text in
             guard let self else { return }
             Task { @MainActor in
@@ -89,10 +135,56 @@ final class AudioTranscriptionManager: ObservableObject {
                 let isActive = self.activeSessionID == sessionID
                 self.stateLock.unlock()
                 print("[LivePreview][diag] partial text for \(sessionID) (isActive=\(isActive)): \"\(text)\"")
+                LivePreviewLog.logger.notice("partial text (active=\(isActive, privacy: .public)): \(text.count, privacy: .public) chars")
                 guard isActive else { return }
                 self.partialText = text
             }
         }
+    }
+
+    private func deferUntilModelLoads(sessionID: UUID) {
+        stateLock.lock()
+        activeSessionID = sessionID
+        waitingForModel = LiveAudioCatchUpBuffer(maxDuration: WhisperLivePreviewEngine.catchUpDuration)
+        stateLock.unlock()
+        LivePreviewLog.logger.notice("live preview deferred: the model is still loading")
+        // Publishes after `currentEngine` is installed, on the main actor.
+        modelLoadCancellable = TranscriptionService.shared.engineDidLoad
+            .first()
+            .sink { [weak self] in self?.startAfterModelLoad(sessionID: sessionID) }
+    }
+
+    private func startAfterModelLoad(sessionID: UUID) {
+        modelLoadCancellable = nil
+        stateLock.lock()
+        let stillWaiting = activeSessionID == sessionID && waitingForModel != nil
+        stateLock.unlock()
+        guard stillWaiting else { return }
+
+        guard let liveEngine = makeWhisperEngine() else {
+            // The loaded engine isn't Whisper (e.g. Parakeet): nothing to attach to.
+            stateLock.lock()
+            if activeSessionID == sessionID { waitingForModel = nil }
+            stateLock.unlock()
+            LivePreviewLog.logger.notice("live preview not started after the load: the loaded engine is not Whisper")
+            return
+        }
+        begin(liveEngine, sessionID: sessionID)
+
+        // Install the engine and hand it the earlier audio under the same lock the
+        // tap thread uses, so live buffers arriving meanwhile queue up strictly
+        // after the catch-up audio.
+        stateLock.lock()
+        guard activeSessionID == sessionID, let caughtUp = waitingForModel else {
+            stateLock.unlock()
+            liveEngine.stop()
+            return
+        }
+        waitingForModel = nil
+        engine = liveEngine
+        liveEngine.prime(caughtUp.buffers)
+        stateLock.unlock()
+        LivePreviewLog.logger.notice("live preview started after the model loaded; caught up \(String(format: "%.2f", caughtUp.duration), privacy: .public)s of audio (\(caughtUp.buffers.count, privacy: .public) buffers)")
     }
 
     private nonisolated(unsafe) var didLogFirstBuffer = false
@@ -101,6 +193,9 @@ final class AudioTranscriptionManager: ObservableObject {
         stateLock.lock()
         let isActive = activeSessionID == sessionID
         let currentEngine = engine
+        if isActive, currentEngine == nil {
+            waitingForModel?.append(buffer)
+        }
         stateLock.unlock()
         if !didLogFirstBuffer {
             didLogFirstBuffer = true
@@ -117,10 +212,16 @@ final class AudioTranscriptionManager: ObservableObject {
             return
         }
         let stoppingEngine = engine
+        let neverStarted = waitingForModel != nil
         activeSessionID = nil
         engine = nil
+        waitingForModel = nil
         stateLock.unlock()
 
+        modelLoadCancellable = nil
+        if neverStarted {
+            LivePreviewLog.logger.notice("live preview never started: the recording ended before the model finished loading")
+        }
         batchBusyCancellable = nil
         stoppingEngine?.stop()
         partialText = nil
@@ -253,18 +354,50 @@ final class WhisperLivePreviewEngine: LivePreviewEngine {
         }
     }
 
-    private func handle(buffer: AVAudioPCMBuffer) {
-        guard state != nil else { return }
+    /// How much earlier audio a late-started preview is worth catching up on: the
+    /// engine only ever keeps this trailing window, so anything older would be
+    /// dropped on arrival.
+    static var catchUpDuration: TimeInterval { windowDuration }
 
+    /// Takes in audio that was recorded before this engine existed (the model was
+    /// still loading), without decoding along the way. Decoding once per step while
+    /// replaying would queue several decodes ahead of the live audio; instead the
+    /// window is filled and exactly one decode is due on the next live buffer.
+    func prime(_ buffers: [AVAudioPCMBuffer]) {
+        queue.async { [weak self] in
+            guard let self, self.state != nil else { return }
+            for buffer in buffers {
+                _ = self.ingest(buffer)
+            }
+            let windowSamples = Int(Self.windowDuration * Self.sampleRate)
+            if self.pendingSamples.count > windowSamples {
+                self.pendingSamples.removeFirst(self.pendingSamples.count - windowSamples)
+            }
+            self.samplesSinceLastDecode = Int(Self.stepDuration * Self.sampleRate)
+            LivePreviewLog.logger.notice("live preview primed with \(String(format: "%.2f", Double(self.pendingSamples.count) / Self.sampleRate), privacy: .public)s of earlier audio from \(buffers.count, privacy: .public) buffers")
+        }
+    }
+
+    private func handle(buffer: AVAudioPCMBuffer) {
+        guard state != nil, ingest(buffer) else { return }
+
+        let stepSamples = Int(Self.stepDuration * Self.sampleRate)
+        guard samplesSinceLastDecode >= stepSamples, !isDecoding else { return }
+        samplesSinceLastDecode = 0
+        decodeCurrentWindow()
+    }
+
+    /// Converts to 16 kHz mono and appends to the window. False if nothing came out.
+    private func ingest(_ buffer: AVAudioPCMBuffer) -> Bool {
         if converter == nil || converter?.inputFormat != buffer.format {
             converter = AVAudioConverter(from: buffer.format, to: targetFormat)
             converter?.sampleRateConverterQuality = AVAudioQuality.max.rawValue
         }
-        guard let converter else { return }
+        guard let converter else { return false }
 
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
         let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else { return }
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else { return false }
 
         var consumed = false
         var convError: NSError?
@@ -277,16 +410,12 @@ final class WhisperLivePreviewEngine: LivePreviewEngine {
             status.pointee = .haveData
             return buffer
         }
-        guard convError == nil, outBuffer.frameLength > 0, let channelData = outBuffer.floatChannelData else { return }
+        guard convError == nil, outBuffer.frameLength > 0, let channelData = outBuffer.floatChannelData else { return false }
 
         let newSamples = UnsafeBufferPointer(start: channelData[0], count: Int(outBuffer.frameLength))
         pendingSamples.append(contentsOf: newSamples)
         samplesSinceLastDecode += newSamples.count
-
-        let stepSamples = Int(Self.stepDuration * Self.sampleRate)
-        guard samplesSinceLastDecode >= stepSamples, !isDecoding else { return }
-        samplesSinceLastDecode = 0
-        decodeCurrentWindow()
+        return true
     }
 
     private func decodeCurrentWindow() {
