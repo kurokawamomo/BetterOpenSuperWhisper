@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 @MainActor
 class TranscriptionService: ObservableObject {
@@ -93,11 +94,26 @@ class TranscriptionService: ObservableObject {
             try engine.prepareForRecording()
         }
         recordingPreparation = RecordingPreparation(engine: engine, task: task)
+        IdleUnloadLog.logger.notice("recording preparation started")
         let id = UUID()
         backgroundOperations[id] = Task { [weak self] in
-            _ = await task.result
+            let result = await task.result
+            // Only a preparation still running counts as "engine in use". One that
+            // finished and was never consumed (recording cancelled, failed, or
+            // stopped before any transcription) must not block releasing the model
+            // forever. A failed preparation is kept so the next transcription
+            // still surfaces its error.
+            if case .success = result {
+                self?.finishRecordingPreparation(task)
+            }
             self?.backgroundOperations[id] = nil
         }
+    }
+
+    private func finishRecordingPreparation(_ task: Task<Void, Error>) {
+        guard recordingPreparation?.task == task else { return }
+        recordingPreparation = nil
+        IdleUnloadLog.logger.notice("recording preparation finished and released")
     }
     
     struct EngineSelection: Equatable {
@@ -253,12 +269,17 @@ class TranscriptionService: ObservableObject {
     /// `ensureEngineLoaded()` can later bring back the same engine.
     @discardableResult
     func unloadEngine() -> Bool {
-        guard !isShuttingDown, !isEngineInUse, let engine = currentEngine else { return false }
+        guard !isShuttingDown, !isEngineInUse, let engine = currentEngine else {
+            IdleUnloadLog.logger.notice("unloadEngine refused: shuttingDown=\(self.isShuttingDown, privacy: .public) loading=\(self.isLoading, privacy: .public) transcribing=\(self.isTranscribing, privacy: .public) transcriptionTask=\(self.transcriptionTask != nil, privacy: .public) recordingPreparation=\(self.recordingPreparation != nil, privacy: .public) engineLoaded=\(self.currentEngine != nil, privacy: .public)")
+            return false
+        }
+        IdleUnloadLog.logger.notice("unloadEngine accepted")
         currentEngine = nil
         let previous = unloadTask
         unloadTask = Task.detached(priority: .utility) {
             _ = await previous?.value
             engine.unload()
+            IdleUnloadLog.logger.notice("engine.unload() returned")
             // Freed model and transcription buffers linger in malloc's free lists
             // and still count toward the footprint; hand them back to the system.
             malloc_zone_pressure_relief(nil, 0)
@@ -272,6 +293,7 @@ class TranscriptionService: ObservableObject {
     /// broken model must not be retried on every key press).
     func ensureEngineLoaded() {
         guard !isShuttingDown, !isLoading, currentEngine == nil, loadingError == nil else { return }
+        IdleUnloadLog.logger.notice("ensureEngineLoaded: starting a load")
         loadEngine(selection: .current)
     }
 
