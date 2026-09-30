@@ -52,12 +52,14 @@ class TranscriptionService: ObservableObject {
         let preparation = recordingPreparation
         let activeTask = transcriptionTask
         let operations = Array(backgroundOperations.values)
+        let pendingUnload = unloadTask
         let task = Task {
             _ = await activeTask?.task.result
             _ = await preparation?.task.result
             for operation in operations {
                 await operation.value
             }
+            _ = await pendingUnload?.value
             for engine in shutdownEngines {
                 engine.unload()
             }
@@ -116,10 +118,20 @@ class TranscriptionService: ObservableObject {
     private var engineLoadTask: Task<TranscriptionEngine, Error>?
     private var engineLoadID: UUID?
     private var engineSelection: EngineSelection?
+    private var unloadTask: Task<Void, Never>?
 
-    init(selection: EngineSelection = .current, engineLoader: @escaping (EngineSelection) async throws -> TranscriptionEngine = TranscriptionService.makeEngine) {
+    /// With idle unloading on, nothing is loaded at launch: the first key press
+    /// loads the model (see `ensureEngineLoaded`), so a freshly started app is as
+    /// light as one whose model was released after sitting idle.
+    init(
+        selection: EngineSelection = .current,
+        loadOnInit: Bool = !AppPreferences.shared.unloadModelWhenIdle,
+        engineLoader: @escaping (EngineSelection) async throws -> TranscriptionEngine = TranscriptionService.makeEngine
+    ) {
         self.engineLoader = engineLoader
-        loadEngine(selection: selection)
+        if loadOnInit {
+            loadEngine(selection: selection)
+        }
     }
 
     init(engine: TranscriptionEngine) {
@@ -178,7 +190,11 @@ class TranscriptionService: ObservableObject {
         loadingError = nil
         isLoading = true
         let loader = engineLoader
+        // A release still tearing down the previous engine must finish first, so
+        // freeing and loading never overlap.
+        let pendingUnload = unloadTask
         let task = Task.detached(priority: .userInitiated) {
+            _ = await pendingUnload?.value
             let engine = try await loader(selection)
             try Task.checkCancellation()
             return engine
@@ -210,6 +226,10 @@ class TranscriptionService: ObservableObject {
 
     func waitUntilReady() async throws {
         guard !isShuttingDown else { throw CancellationError() }
+        // Every transcription path (recording, dropped files, the queue) passes
+        // here, so one that arrives after an idle release brings the model back
+        // instead of failing on a missing engine.
+        ensureEngineLoaded()
         while let task = engineLoadTask, let id = engineLoadID {
             let result = await task.result
             try Task.checkCancellation()
@@ -219,6 +239,40 @@ class TranscriptionService: ObservableObject {
         try Task.checkCancellation()
         guard !isShuttingDown else { throw CancellationError() }
         guard currentEngine != nil else { throw TranscriptionError.contextInitializationFailed }
+    }
+
+    var isEngineLoaded: Bool { currentEngine != nil }
+
+    /// True while anything is using, or about to use, the loaded engine.
+    var isEngineInUse: Bool {
+        isLoading || isTranscribing || transcriptionTask != nil || recordingPreparation != nil
+    }
+
+    /// Releases the loaded engine so its memory goes back to the system. Refuses
+    /// (returns false) while the engine is in use. `engineSelection` is kept so
+    /// `ensureEngineLoaded()` can later bring back the same engine.
+    @discardableResult
+    func unloadEngine() -> Bool {
+        guard !isShuttingDown, !isEngineInUse, let engine = currentEngine else { return false }
+        currentEngine = nil
+        let previous = unloadTask
+        unloadTask = Task.detached(priority: .utility) {
+            _ = await previous?.value
+            engine.unload()
+            // Freed model and transcription buffers linger in malloc's free lists
+            // and still count toward the footprint; hand them back to the system.
+            malloc_zone_pressure_relief(nil, 0)
+        }
+        return true
+    }
+
+    /// Starts loading when the engine was released while idle, or was never loaded
+    /// because idle unloading skipped the launch-time load. Does nothing while a
+    /// load is running, once the engine is present, or after a failed load (a
+    /// broken model must not be retried on every key press).
+    func ensureEngineLoaded() {
+        guard !isShuttingDown, !isLoading, currentEngine == nil, loadingError == nil else { return }
+        loadEngine(selection: .current)
     }
 
     func reloadEngine() {

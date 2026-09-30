@@ -28,7 +28,11 @@ class IndicatorViewModel: ObservableObject {
     @Published var isConfirmingCancel = false
     @Published var recorder: AudioRecorder = .shared
     @Published var livePreviewText: String?
-    
+    /// True while a finished recording waits for the model to finish loading.
+    /// Shown as "Processing..." inside the decoding state, so the decoding
+    /// logic itself (cancel, session handling) is untouched.
+    @Published private(set) var isWaitingForModel = false
+
     var recordingStartedAt: Date?
     
     var delegate: IndicatorViewDelegate?
@@ -111,8 +115,11 @@ class IndicatorViewModel: ObservableObject {
             .store(in: &cancellables)
     }
     
+    /// Model loading is deliberately not "busy": a recording can start and stop
+    /// while the model loads in the background, and transcription waits for the
+    /// load itself (`TranscriptionService.waitUntilReady`).
     var isTranscriptionBusy: Bool {
-        transcriptionService.isLoading || transcriptionService.isTranscribing || transcriptionQueue.isProcessing
+        transcriptionService.isTranscribing || transcriptionQueue.isProcessing
     }
     
     func showBusyMessage() {
@@ -164,6 +171,9 @@ class IndicatorViewModel: ObservableObject {
         // publishes isConnecting/isRecording, which the sinks above translate
         // into .connecting/.recording.
         guard let id = RecordingSessionController.shared.begin(stop: { self.decodeRecording() }) else { return }
+        // If the model was released while idle, bring it back in the background
+        // while the user is already talking.
+        transcriptionService.ensureEngineLoaded()
         recordingSessionID = id
         state = .recording
         startBlinking()
@@ -267,6 +277,18 @@ class IndicatorViewModel: ObservableObject {
                     throw CancellationError()
                 }
 
+                if transcriptionService.isLoading {
+                    isWaitingForModel = true
+                    // A failed load is not handled here: transcribeAudio waits
+                    // again and throws, which the error path below already covers.
+                    try? await transcriptionService.waitUntilReady()
+                    isWaitingForModel = false
+                    try Task.checkCancellation()
+                    guard self.decodingSessionID == sessionID else {
+                        throw CancellationError()
+                    }
+                }
+
                 let text = try await transcriptionService.transcribeAudio(
                     url: tempURL,
                     settings: Settings(),
@@ -337,6 +359,7 @@ class IndicatorViewModel: ObservableObject {
         guard decodingSessionID == sessionID else { return }
         decodingSessionID = nil
         decodingTask = nil
+        isWaitingForModel = false
         RecordingSessionController.shared.finish(recordingSessionID)
         recordingSessionID = nil
         _ = delegate?.didFinishDecoding(from: self)
@@ -401,6 +424,7 @@ class IndicatorViewModel: ObservableObject {
     func cancelRecording() {
         hideTimer?.invalidate()
         hideTimer = nil
+        isWaitingForModel = false
 
         if state == .decoding {
             // In decoding the recorder is already stopped. Cancel both the
@@ -489,6 +513,19 @@ struct IndicatorWindow: View {
             ? Color.black.opacity(0.24)
             : Color.white.opacity(0.24)
     }
+
+    private var processingLabel: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "hourglass")
+                .foregroundColor(.orange)
+                .frame(width: 24)
+
+            Text("Processing...")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.orange)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
     
     var body: some View {
 
@@ -529,27 +566,22 @@ struct IndicatorWindow: View {
                 .animation(.easeInOut(duration: 0.2), value: viewModel.isConfirmingCancel)
                 
             case .decoding:
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .scaleEffect(0.7)
-                        .frame(width: 24)
-                    
-                    Text("Transcribing...")
-                        .font(.system(size: 13, weight: .semibold))
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                
-            case .busy:
-                HStack(spacing: 8) {
-                    Image(systemName: "hourglass")
-                        .foregroundColor(.orange)
-                        .frame(width: 24)
+                if viewModel.isWaitingForModel {
+                    processingLabel
+                } else {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .scaleEffect(0.7)
+                            .frame(width: 24)
 
-                    Text("Processing...")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.orange)
+                        Text("Transcribing...")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+
+            case .busy:
+                processingLabel
 
             case .noMicrophone:
                 HStack(spacing: 8) {

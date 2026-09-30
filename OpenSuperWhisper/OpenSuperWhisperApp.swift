@@ -56,6 +56,7 @@ struct OpenSuperWhisperApp: App {
         _ = ShortcutManager.shared
         _ = MicrophoneService.shared
         KeyEventHandler.shared.start()
+        IdleModelUnloader.shared.start()
         WhisperModelManager.shared.ensureDefaultModelPresent()
     }
 }

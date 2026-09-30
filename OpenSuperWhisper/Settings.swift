@@ -242,6 +242,20 @@ class SettingsViewModel: ObservableObject {
         }
     }
 
+    @Published var unloadModelWhenIdle: Bool {
+        didSet {
+            AppPreferences.shared.unloadModelWhenIdle = unloadModelWhenIdle
+            NotificationCenter.default.post(name: .idleUnloadSettingsChanged, object: nil)
+        }
+    }
+
+    @Published var unloadModelIdleMinutes: Double {
+        didSet {
+            AppPreferences.shared.unloadModelIdleMinutes = Int(unloadModelIdleMinutes)
+            NotificationCenter.default.post(name: .idleUnloadSettingsChanged, object: nil)
+        }
+    }
+
     private let downloadWhisper: (URL, String, @escaping (Double) -> Void) async throws -> Void
 
     private let downloadFluid: (AsrModelVersion, ProgressHandler?) async throws -> AsrModels
@@ -282,6 +296,8 @@ class SettingsViewModel: ObservableObject {
         self.tapHoldThresholdMs = prefs.tapHoldThresholdMs
         self.tapAction = TapAction(rawValue: prefs.tapAction) ?? .launchSiri
         self.tapActionCustomScriptPath = prefs.tapActionCustomScriptPath
+        self.unloadModelWhenIdle = prefs.unloadModelWhenIdle
+        self.unloadModelIdleMinutes = Double(prefs.unloadModelIdleMinutes)
 
         if let savedPath = prefs.selectedWhisperModelPath ?? prefs.selectedModelPath {
             self.selectedModelURL = URL(fileURLWithPath: savedPath)
@@ -920,6 +936,45 @@ struct SettingsView: View {
                         .padding(.top, 8)
                     }
                 }
+
+                Divider()
+                    .padding(.vertical, 4)
+
+                Text("Memory")
+                    .font(.headline)
+                    .foregroundColor(.primary)
+
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Unload Model When Idle")
+                                .font(.subheadline)
+                            Text("Frees the model from memory after a period of inactivity. It loads again when you next start recording.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Toggle("", isOn: $viewModel.unloadModelWhenIdle)
+                            .toggleStyle(SwitchToggleStyle(tint: Color.accentColor))
+                            .labelsHidden()
+                    }
+
+                    if viewModel.unloadModelWhenIdle {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Unload After:")
+                                    .font(.subheadline)
+                                Spacer()
+                                Text("\(Int(viewModel.unloadModelIdleMinutes)) min")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            Slider(value: $viewModel.unloadModelIdleMinutes, in: 1...30, step: 1)
+                                .help("How long to wait after the last transcription before freeing the model")
+                        }
+                    }
+                }
             }
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -928,7 +983,7 @@ struct SettingsView: View {
         }
         .padding()
     }
-    
+
     private var transcriptionSettings: some View {
         ScrollView {
             VStack(spacing: 20) {

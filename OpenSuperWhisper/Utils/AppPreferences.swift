@@ -161,4 +161,11 @@ final class AppPreferences {
 
     @UserDefault(key: "tapActionCustomScriptPath", defaultValue: "")
     var tapActionCustomScriptPath: String
+
+    // Free the model from memory while the app is idle
+    @UserDefault(key: "unloadModelWhenIdle", defaultValue: false)
+    var unloadModelWhenIdle: Bool
+
+    @UserDefault(key: "unloadModelIdleMinutes", defaultValue: 5)
+    var unloadModelIdleMinutes: Int
 }

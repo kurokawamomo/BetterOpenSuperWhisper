@@ -35,6 +35,8 @@ private final class ControlledTranscriptionEngine: TranscriptionEngine {
 
     func initialize() async throws {}
 
+    func unload() {}
+
     func transcribeAudio(url: URL, settings: Settings) async throws -> String {
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<String, Error>) in
